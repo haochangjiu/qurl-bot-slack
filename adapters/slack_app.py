@@ -1,15 +1,19 @@
 """
-Slack adapter for QURL proxy bot.
+Slack adapter for qurl-bot-slack.
 
-Uses core.bot_core for message processing; Slack Bolt for events and slash commands.
+OAuth (multi-workspace) + SQLite installation store + Socket Mode for events.
 """
 
 import asyncio
 import logging
 import re
 
-from slack_bolt.async_app import AsyncApp
+from aiohttp import web
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
+from slack_bolt.async_app import AsyncApp
+from slack_bolt.oauth.async_oauth_settings import AsyncOAuthSettings
+from slack_sdk.oauth.installation_store.sqlite3 import SQLite3InstallationStore
+from slack_sdk.oauth.state_store.file import FileOAuthStateStore
 
 from config import settings
 from core.bot_core import (
@@ -21,26 +25,64 @@ from core.bot_core import (
     handle_mykey,
     handle_delkey,
     preprocess_text,
-    PLATFORM_SLACK,
+    detect_language,
 )
+from services.workspace_key_store import init_workspace_key_table
+from services.slack_entitlements import classify_layerv_key_eligibility
 from services.i18n import get_message
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = AsyncApp(token=settings.slack_bot_token)
+
+def _scope_list() -> list[str]:
+    return [s.strip() for s in settings.slack_bot_scopes.split(",") if s.strip()]
+
+
+def build_slack_app() -> AsyncApp:
+    settings.sqlite_database_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.oauth_state_dir.mkdir(parents=True, exist_ok=True)
+    init_workspace_key_table()
+
+    installation_store = SQLite3InstallationStore(
+        database=str(settings.sqlite_database_path),
+        client_id=settings.slack_client_id,
+        logger=logger,
+    )
+    state_store = FileOAuthStateStore(
+        expiration_seconds=600,
+        base_dir=str(settings.oauth_state_dir),
+        client_id=settings.slack_client_id,
+        logger=logger,
+    )
+
+    oauth_settings = AsyncOAuthSettings(
+        client_id=settings.slack_client_id,
+        client_secret=settings.slack_client_secret,
+        scopes=_scope_list(),
+        redirect_uri=settings.slack_redirect_uri,
+        install_path=settings.oauth_install_path,
+        redirect_uri_path=settings.oauth_redirect_path,
+        installation_store=installation_store,
+        installation_store_bot_only=True,
+        state_store=state_store,
+        success_url=settings.oauth_success_url,
+        failure_url=settings.oauth_failure_url,
+    )
+
+    app = AsyncApp(
+        signing_secret=settings.slack_signing_secret,
+        oauth_settings=oauth_settings,
+    )
+    register_slack_handlers(app)
+    return app
 
 
 def _preprocess_slack(text: str) -> str:
-    """Slack-specific preprocessing (links, etc.)."""
-    return preprocess_text(text, PLATFORM_SLACK)
+    return preprocess_text(text)
 
 
 def _parse_command(text: str) -> tuple[str | None, str]:
-    """
-    Parse /setkey, /mykey, /delkey from message text.
-    Returns (command_name, arg) e.g. ('setkey', 'xxx') or (None, '') if not a command.
-    """
     t = text.strip()
     if t.startswith("/setkey"):
         arg = t[7:].strip()
@@ -50,39 +92,6 @@ def _parse_command(text: str) -> tuple[str | None, str]:
     if t.startswith("/delkey"):
         return ("delkey", "")
     return (None, "")
-
-
-# ============== Slash Commands ==============
-
-
-@app.command("/setkey")
-async def handle_setkey_slack(ack, command, say):
-    await ack()
-    user_id = command["user_id"]
-    api_key = command["text"].strip()
-    logger.info(f"Slack setkey from {user_id}: '{api_key[:12]}...' (len={len(api_key)})")
-    msg, _ = await handle_setkey(user_id, api_key, PLATFORM_SLACK)
-    await say(msg)
-
-
-@app.command("/mykey")
-async def handle_mykey_slack(ack, command, say, client):
-    await ack()
-    user_id = command["user_id"]
-    user_info = await _get_slack_user_info(client, user_id)
-    msg, _ = await handle_mykey(user_id, PLATFORM_SLACK, user_tz=user_info["tz"])
-    await say(msg)
-
-
-@app.command("/delkey")
-async def handle_delkey_slack(ack, command, say):
-    await ack()
-    user_id = command["user_id"]
-    msg, _ = await handle_delkey(user_id, PLATFORM_SLACK)
-    await say(msg)
-
-
-# ============== Message Events ==============
 
 
 _bot_user_id: str | None = None
@@ -97,7 +106,6 @@ async def _get_bot_user_id(client) -> str:
 
 
 async def _get_slack_user_info(client, user_id: str) -> dict:
-    """Get timezone and email from a single users_info call."""
     info: dict = {"tz": None, "email": None}
     if not client:
         return info
@@ -112,179 +120,303 @@ async def _get_slack_user_info(client, user_id: str) -> dict:
     return info
 
 
+async def _is_im_channel(client, channel_id: str) -> bool:
+    try:
+        r = await client.conversations_info(channel=channel_id)
+        if not r.get("ok"):
+            return False
+        ch = r.get("channel") or {}
+        return bool(ch.get("is_im"))
+    except Exception as e:
+        logger.warning(f"conversations_info failed for {channel_id}: {e}")
+        return False
+
+
+def _layerv_key_denial_message(kind: str, lang: str) -> str:
+    if kind == "enterprise_org_admin_required":
+        return get_message("key_enterprise_org_admin_only", lang)
+    return get_message("key_admin_only", lang)
+
+
+def _team_id(event_or_cmd: dict, context_team_id: str | None = None) -> str | None:
+    if context_team_id:
+        return context_team_id
+    return (
+        event_or_cmd.get("team")
+        or event_or_cmd.get("team_id")
+        or event_or_cmd.get("view", {}).get("team_id")
+    )
+
+
 async def _send_dm(client, user: str, text: str):
-    """Open a DM channel with the user and send a message."""
     resp = await client.conversations_open(users=user)
     dm_channel = resp["channel"]["id"]
     await client.chat_postMessage(channel=dm_channel, text=text)
 
 
 def _extract_slack_mentions(text: str) -> list[str]:
-    """Extract user IDs from Slack <@UXXXX> mentions."""
     return re.findall(r"<@([A-Z0-9]+)>", text)
 
 
-@app.event("app_mention")
-async def handle_app_mention(event, say, client):
-    text = event.get("text", "")
-    user = event.get("user")
-
-    bot_id = await _get_bot_user_id(client)
-    mentioned_users = [
-        uid for uid in _extract_slack_mentions(text)
-        if uid != bot_id
-    ]
-
-    clean_text = _preprocess_slack(text)
-    if not clean_text:
-        await say(f"<@{user}> {get_message('empty_input', 'en')}")
-        return
-
-    user_info = await _get_slack_user_info(client, user)
-    user_tz = user_info["tz"]
-    if user_info["email"]:
-        logger.info(f"Slack request from {user} (email: {user_info['email']}): {clean_text}")
-    else:
-        logger.info(f"Slack mention from {user}: {clean_text}")
-
-    cmd, arg = _parse_command(clean_text)
-    if cmd:
-        if cmd == "setkey":
-            msg, _ = await handle_setkey(user, arg, PLATFORM_SLACK)
-        elif cmd == "mykey":
-            msg, _ = await handle_mykey(user, PLATFORM_SLACK, user_tz=user_tz)
-        else:  # delkey
-            msg, _ = await handle_delkey(user, PLATFORM_SLACK)
-        await say(f"<@{user}> {msg}")
-        return
-
-    # Analyze once (AI + URL extraction)
-    analysis = await analyze_message(clean_text, user, PLATFORM_SLACK)
-    if "dashboard" in analysis:
-        await say(f"<@{user}> {_dashboard_reply(analysis['lang'])}")
-        return
-    if "error" in analysis:
-        await say(f"<@{user}> {analysis['error']}")
-        return
-
-    lang = analysis["lang"]
-    dm_targets = mentioned_users if mentioned_users else [user]
-
-    success = []
-    for target in dm_targets:
-        reply, _ = await build_proxy_reply(
-            analysis["urls"], analysis["api_key"], analysis["expires_in"],
-            analysis["reason"], lang, PLATFORM_SLACK, user, user_tz=user_tz,
-        )
-        try:
-            if target == user:
-                await _send_dm(client, target, reply)
-            else:
-                target_info = await _get_slack_user_info(client, target)
-                if target_info["email"]:
-                    logger.info(f"Sending proxy to {target} (email: {target_info['email']})")
-                header = get_message("dm_proxy_for_you", lang, from_user=f"<@{user}>")
-                await _send_dm(client, target, f"{header}\n{reply}")
-            success.append(target)
-        except Exception as e:
-            logger.warning(f"Cannot DM Slack user {target}: {e}")
-
-    if success:
-        if mentioned_users:
-            mentions = " ".join(f"<@{u}>" for u in success)
-            await say(f"<@{user}> {get_message('dm_sent_to_users', lang, users=mentions)}")
-        else:
-            await say(f"<@{user}> {get_message('dm_sent', lang)}")
-    else:
-        await say(f"<@{user}> {get_message('dm_failed', lang)}")
-
-
-@app.event("message")
-async def handle_direct_message(event, say, client):
-    if event.get("channel_type") != "im":
-        return
-    if event.get("subtype"):
-        return
-    if re.search(r"<@[A-Z0-9]+>", event.get("text", "")):
-        return
-
-    text = event.get("text", "")
-    user = event.get("user")
-    clean_text = _preprocess_slack(text)
-    if not clean_text:
-        await say(f"<@{user}> {get_message('empty_input', 'en')}")
-        return
-
-    user_info = await _get_slack_user_info(client, user)
-    if user_info["email"]:
-        logger.info(f"Slack DM from {user} (email: {user_info['email']}): {clean_text}")
-    else:
-        logger.info(f"Slack DM from {user}: {clean_text}")
-
-    cmd, arg = _parse_command(clean_text)
-    if cmd:
-        if cmd == "setkey":
-            msg, _ = await handle_setkey(user, arg, PLATFORM_SLACK)
-        elif cmd == "mykey":
-            msg, _ = await handle_mykey(user, PLATFORM_SLACK, user_tz=user_info["tz"])
-        else:
-            msg, _ = await handle_delkey(user, PLATFORM_SLACK)
-        await say(f"<@{user}> {msg}")
-        return
-
-    reply, _ = await process_message(clean_text, user, PLATFORM_SLACK, user_tz=user_info["tz"])
-    await say(f"<@{user}> {reply}")
-
-
-@app.event("app_home_opened")
-async def handle_app_home_opened(client, event):
-    try:
-        await client.views_publish(
-            user_id=event["user"],
-            view={
-                "type": "home",
-                "blocks": [
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"{get_message('welcome_title', 'en')} / {get_message('welcome_title', 'zh')}",
-                        },
-                    },
-                    {"type": "divider"},
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": get_message("welcome_body", "en"),
-                        },
-                    },
-                    {"type": "divider"},
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": get_message("welcome_body", "zh"),
-                        },
-                    },
-                ],
-            },
-        )
-    except Exception as e:
-        err_str = str(e)
-        if "not_enabled" in err_str.lower():
-            logger.debug(
-                "App Home not enabled. Enable at: https://api.slack.com/apps > Your App > App Home"
+def register_slack_handlers(app: AsyncApp) -> None:
+    @app.command("/setkey")
+    async def handle_setkey_slack(ack, command, client, respond):
+        await ack()
+        user_id = command["user_id"]
+        team_id = command.get("team_id")
+        channel_id = command["channel_id"]
+        lang = detect_language(command.get("text") or "")
+        if not await _is_im_channel(client, channel_id):
+            await respond(
+                text=get_message("key_ops_dm_only", lang),
+                response_type="ephemeral",
             )
+            return
+        lvl = await classify_layerv_key_eligibility(client, user_id)
+        if lvl != "ok":
+            await respond(
+                text=_layerv_key_denial_message(lvl, lang),
+                response_type="ephemeral",
+            )
+            return
+        api_key = (command.get("text") or "").strip()
+        logger.info(f"Slack setkey from admin {user_id}, key_len={len(api_key)}")
+        msg, out_lang = await handle_setkey(api_key, team_id, True, lang)
+        await respond(text=msg)
+
+    @app.command("/mykey")
+    async def handle_mykey_slack(ack, command, client, respond):
+        await ack()
+        user_id = command["user_id"]
+        team_id = command.get("team_id")
+        channel_id = command["channel_id"]
+        lang = detect_language(command.get("text") or "")
+        if not await _is_im_channel(client, channel_id):
+            await respond(
+                text=get_message("key_ops_dm_only", lang),
+                response_type="ephemeral",
+            )
+            return
+        lvl = await classify_layerv_key_eligibility(client, user_id)
+        if lvl != "ok":
+            await respond(
+                text=_layerv_key_denial_message(lvl, lang),
+                response_type="ephemeral",
+            )
+            return
+        user_info = await _get_slack_user_info(client, user_id)
+        msg, _ = await handle_mykey(team_id, True, user_info["tz"], lang)
+        await respond(text=msg)
+
+    @app.command("/delkey")
+    async def handle_delkey_slack(ack, command, client, respond):
+        await ack()
+        user_id = command["user_id"]
+        team_id = command.get("team_id")
+        channel_id = command["channel_id"]
+        lang = detect_language(command.get("text") or "")
+        if not await _is_im_channel(client, channel_id):
+            await respond(
+                text=get_message("key_ops_dm_only", lang),
+                response_type="ephemeral",
+            )
+            return
+        lvl = await classify_layerv_key_eligibility(client, user_id)
+        if lvl != "ok":
+            await respond(
+                text=_layerv_key_denial_message(lvl, lang),
+                response_type="ephemeral",
+            )
+            return
+        msg, _ = await handle_delkey(team_id, True, lang)
+        await respond(text=msg)
+
+    @app.event("app_mention")
+    async def handle_app_mention(event, say, client, context=None):
+        text = event.get("text", "")
+        user = event.get("user")
+        team_id = _team_id(event, getattr(context, "team_id", None) if context else None)
+
+        bot_id = await _get_bot_user_id(client)
+        mentioned_users = [
+            uid for uid in _extract_slack_mentions(text)
+            if uid != bot_id
+        ]
+
+        clean_text = _preprocess_slack(text)
+        if not clean_text:
+            await say(f"<@{user}> {get_message('empty_input', 'en')}")
+            return
+
+        user_info = await _get_slack_user_info(client, user)
+        user_tz = user_info["tz"]
+        lang_hint = detect_language(clean_text)
+        if user_info["email"]:
+            logger.info(f"Slack request from {user} (email: {user_info['email']}): {clean_text}")
         else:
-            logger.warning(f"Failed to publish app home: {e}")
+            logger.info(f"Slack mention from {user}: {clean_text}")
+
+        cmd, arg = _parse_command(clean_text)
+        if cmd:
+            await say(f"<@{user}> {get_message('key_ops_dm_only', lang_hint)}")
+            return
+
+        analysis = await analyze_message(clean_text, user, team_id)
+        if "dashboard" in analysis:
+            await say(f"<@{user}> {_dashboard_reply(analysis['lang'])}")
+            return
+        if "error" in analysis:
+            await say(f"<@{user}> {analysis['error']}")
+            return
+
+        lang = analysis["lang"]
+        dm_targets = mentioned_users if mentioned_users else [user]
+
+        success = []
+        for target in dm_targets:
+            reply, _ = await build_proxy_reply(
+                analysis["urls"], analysis["api_key"], analysis["expires_in"],
+                analysis["reason"], lang, user, user_tz=user_tz,
+            )
+            try:
+                if target == user:
+                    await _send_dm(client, target, reply)
+                else:
+                    target_info = await _get_slack_user_info(client, target)
+                    if target_info["email"]:
+                        logger.info(f"Sending proxy to {target} (email: {target_info['email']})")
+                    header = get_message("dm_proxy_for_you", lang, from_user=f"<@{user}>")
+                    await _send_dm(client, target, f"{header}\n{reply}")
+                success.append(target)
+            except Exception as e:
+                logger.warning(f"Cannot DM Slack user {target}: {e}")
+
+        if success:
+            if mentioned_users:
+                mentions = " ".join(f"<@{u}>" for u in success)
+                await say(f"<@{user}> {get_message('dm_sent_to_users', lang, users=mentions)}")
+            else:
+                await say(f"<@{user}> {get_message('dm_sent', lang)}")
+        else:
+            await say(f"<@{user}> {get_message('dm_failed', lang)}")
+
+    @app.event("message")
+    async def handle_direct_message(event, say, client, context=None):
+        if event.get("channel_type") != "im":
+            return
+        if event.get("subtype"):
+            return
+        if re.search(r"<@[A-Z0-9]+>", event.get("text", "")):
+            return
+
+        text = event.get("text", "")
+        user = event.get("user")
+        team_id = _team_id(event, getattr(context, "team_id", None) if context else None)
+        clean_text = _preprocess_slack(text)
+        if not clean_text:
+            await say(f"<@{user}> {get_message('empty_input', 'en')}")
+            return
+
+        user_info = await _get_slack_user_info(client, user)
+        lang = detect_language(clean_text)
+        if user_info["email"]:
+            logger.info(f"Slack DM from {user} (email: {user_info['email']}): {clean_text}")
+        else:
+            logger.info(f"Slack DM from {user}: {clean_text}")
+
+        cmd, arg = _parse_command(clean_text)
+        if cmd:
+            lvl = await classify_layerv_key_eligibility(client, user)
+            if lvl != "ok":
+                await say(f"<@{user}> {_layerv_key_denial_message(lvl, lang)}")
+                return
+            if cmd == "setkey":
+                msg, _ = await handle_setkey(arg, team_id, True, lang)
+            elif cmd == "mykey":
+                msg, _ = await handle_mykey(team_id, True, user_info["tz"], lang)
+            else:
+                msg, _ = await handle_delkey(team_id, True, lang)
+            await say(f"<@{user}> {msg}")
+            return
+
+        reply, _ = await process_message(clean_text, user, team_id, user_tz=user_info["tz"])
+        await say(f"<@{user}> {reply}")
+
+    @app.event("app_home_opened")
+    async def handle_app_home_opened(client, event):
+        try:
+            await client.views_publish(
+                user_id=event["user"],
+                view={
+                    "type": "home",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"{get_message('welcome_title', 'en')} / {get_message('welcome_title', 'zh')}",
+                            },
+                        },
+                        {"type": "divider"},
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": get_message("welcome_body", "en"),
+                            },
+                        },
+                        {"type": "divider"},
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": get_message("welcome_body", "zh"),
+                            },
+                        },
+                    ],
+                },
+            )
+        except Exception as e:
+            err_str = str(e)
+            if "not_enabled" in err_str.lower():
+                logger.debug(
+                    "App Home not enabled. Enable at: https://api.slack.com/apps > Your App > App Home"
+                )
+            else:
+                logger.warning(f"Failed to publish app home: {e}")
 
 
-async def run_slack():
-    """Run Slack bot. Blocks until shutdown."""
-    handler = AsyncSocketModeHandler(app, settings.slack_app_token)
-    logger.info("Starting Slack QURL Bot...")
-    await handler.start_async()
+async def run_slack_oauth_server(bolt_app: AsyncApp) -> web.AppRunner:
+    """Start aiohttp app for /slack/install and /slack/oauth_redirect only."""
+    srv = bolt_app.server(
+        port=settings.http_port,
+        path="/slack/events",
+        host=settings.http_host,
+    )
+    runner = web.AppRunner(srv.web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, settings.http_host, settings.http_port)
+    await site.start()
+    logger.info(
+        "OAuth HTTP server on %s:%s (install=%s, callback=%s)",
+        settings.http_host,
+        settings.http_port,
+        settings.oauth_install_path,
+        settings.oauth_redirect_path,
+    )
+    return runner
+
+
+async def run_slack() -> None:
+    """Run OAuth endpoints + Socket Mode until shutdown."""
+    bolt_app = build_slack_app()
+    runner = await run_slack_oauth_server(bolt_app)
+    try:
+        handler = AsyncSocketModeHandler(bolt_app, settings.slack_app_token)
+        logger.info("Starting qurl-bot-slack (Socket Mode + OAuth)...")
+        await handler.start_async()
+    finally:
+        await runner.cleanup()
 
 
 if __name__ == "__main__":

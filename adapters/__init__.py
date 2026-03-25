@@ -1,1 +1,1 @@
-"""Platform adapters for Slack and Discord."""
+"""Slack adapter."""

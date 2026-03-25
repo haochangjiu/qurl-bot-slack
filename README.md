@@ -1,136 +1,95 @@
-# QURL Bot for Slack
+# qurl-bot-slack
 
-帮助用户在 Slack  LayerV QURL API 生成安全的代理访问链接。
+Generates secure proxy links via the LayerV QURL API in Slack. Supports **OAuth multi-workspace install** (for [Slack Marketplace](https://api.slack.com/docs/slack-apps-checklist) style distribution), **SQLite** for installation data, and **Socket Mode** for events.
 
-## 功能
+## Features
 
-- 解析用户消息中的 URL
-- 识别用户意图（是否需要代理链接）
-- 调用 LayerV API 生成 QURL
-- 支持自定义过期时间
-- 支持 Slack 和 Discord 双平台
+- Parses user messages for URLs and intent
+- Calls the LayerV API to create QURLs
+- Configurable expiry
+- **Per-workspace** LayerV API key: manage with `/setkey`, `/mykey`, `/delkey` in a **DM with the bot** only; **no key operations in channels** (anti-leak).  
+  - **Enterprise Grid**: must be **Enterprise organization** Primary Owner / Owner / Admin (`enterprise_user` in `users.info`); workspace-only admin is not enough.  
+  - **Non–Enterprise Grid**: by default, workspace Primary Owner / Owner / Admin may configure (disable with `LAYERV_KEY_ALLOW_WORKSPACE_ADMIN_IF_NOT_ENTERPRISE_GRID=false`).  
+  - Optional server-side `LAYERV_API_KEY` as fallback when no workspace key is stored.  
+  - Optional `admin.roles.listAssignments` (`admin.roles:read` user token + `SLACK_ORG_ADMIN_ROLE_IDS`) — see `.env.example`.
 
-## 运行方式
+## Requirements
 
-- **仅 Slack**：`python app.py`（需配置 `SLACK_BOT_TOKEN`、`SLACK_APP_TOKEN`）
-- **仅 Discord**：`python run.py`（需配置 `DISCORD_TOKEN`）
-- **同时运行 Slack + Discord**：`python run.py`（需配置所有对应 token）
+- Python 3.10+
+- Slack app with **Socket Mode** and **OAuth** (distribution / App Directory)
+- Public **HTTPS** reverse proxy to this process’s HTTP port (OAuth install/callback only — **not** Events HTTP)
 
----
+## Quick start
 
-## Slack 快速开始
+### 1. Slack app (api.slack.com/apps)
 
-### 1. 创建 Slack App
+1. **OAuth & Permissions → Bot Token Scopes** (aligned with default `SLACK_BOT_SCOPES`):  
+   `app_mentions:read`, `chat:write`, `im:history`, `im:read`, `im:write`, `users:read`, `commands`
 
-1. 访问 [Slack API](https://api.slack.com/apps) 创建新应用
-2. 选择 "From scratch"，输入应用名称和工作区
+2. **Socket Mode**: enable and create an App-Level Token (`connections:write`) → `SLACK_APP_TOKEN`.
 
-### 2. 配置 Bot 权限
+3. **Event Subscriptions**: with Socket Mode enabled, subscribe to:  
+   `app_home_opened`, `app_mention`, `message.im`
 
-在 **OAuth & Permissions** 页面添加以下 Bot Token Scopes:
-- `app_mentions:read` - 读取 @提及
-- `chat:write` - 发送消息
-- `im:history` - 读取私信历史
-- `im:read` - 读取私信
-- `im:write` - 发送私信
-- `users:read` - 读取用户信息（用于根据用户时区显示本地时间）
+4. **Slash Commands**: register `/setkey`, `/mykey`, `/delkey` as needed (prefix with app name for Marketplace to reduce collisions).
 
-### 3. 启用 Socket Mode
+5. **OAuth & Permissions → Redirect URLs**  
+   Add a URL that **exactly** matches `SLACK_REDIRECT_URI` in `.env`, e.g.:  
+   `https://your.domain/slack/oauth_redirect`
 
-1. 在 **Socket Mode** 页面启用 Socket Mode
-2. 生成 App-Level Token (需要 `connections:write` scope)
-3. 保存生成的 `xapp-` token
+6. **Manage distribution**: enable public distribution and complete Slack’s checklist (listing also needs landing page, privacy policy, support, etc.).
 
-### 4. 订阅事件
-
-在 **Event Subscriptions** 页面:
-1. 启用 Events
-2. 订阅以下 Bot Events:
-   - `app_home_opened`
-   - `app_mention`
-   - `message.im`
-
-### 5. 安装应用到工作区
-
-在 **Install App** 页面点击安装，获取 `xoxb-` Bot Token
-
-### 6. 配置环境变量
+### 2. Environment
 
 ```bash
 cp .env.example .env
 ```
 
-编辑 `.env` 文件:
+Required variables are documented in `.env.example`. In production use **HTTPS** for `SLACK_REDIRECT_URI` and proxy `https://your.domain` to this service’s `HTTP_HOST`/`HTTP_PORT`.
 
-```env
-# Slack
-SLACK_BOT_TOKEN=xoxb-your-bot-token
-SLACK_APP_TOKEN=xapp-your-app-token
-
-# LayerV API (从 LayerV 获取)
-LAYERV_API_URL=https://api.layerv.xyz
-LAYERV_AUTH0_DOMAIN=your-domain.auth0.com
-LAYERV_AUTH0_CLIENT_ID=your-client-id
-LAYERV_AUTH0_CLIENT_SECRET=your-client-secret
-LAYERV_AUTH0_AUDIENCE=https://api.layerv.ai
-```
-
-### 7. 安装依赖并运行
+### 3. Install and run
 
 ```bash
-# 创建虚拟环境
-python3 -m venv venv
-source venv/bin/activate
-
-# 安装依赖
+python -m venv .venv
+.venv\Scripts\activate   # Windows
 pip install -r requirements.txt
-
-# 运行
 python app.py
 ```
 
-## 使用示例
+The process:
 
-在 Slack 中:
+- Serves **`/slack/install`** and **`/slack/oauth_redirect`** on `HTTP_HOST`/`HTTP_PORT` (OAuth)
+- Connects to Slack via Socket Mode for events
 
-```
-# 私信机器人
-google.com 请给我代理地址
+Install URL (browser): `https://your.domain/slack/install` (same host as Redirect URL; HTTPS in production).
 
-# 或在频道中 @提及
-@QURLBot https://github.com 帮我生成访问链接 有效期7天
+### 4. Data
 
-# 英文也支持
-@QURLBot example.com proxy please
-```
+- **`SQLITE_DATABASE_PATH`** (default `data/slack_app.db`): OAuth installs (incl. bot tokens), via `slack_sdk` `SQLite3InstallationStore`.
+- **`OAUTH_STATE_DIR`**: short-lived OAuth `state` files (CSRF).
 
-机器人回复:
+## Example usage
 
-```
-@用户
-代理链接已生成:
-
-• 原始网址: google.com
-  代理链接: https://xxx.layerv.ai/q/abc123
-  有效期至: 2024-01-08 20:00:00 (CST)
-```
-
-## 项目结构
+DM the bot or `@mention` it in a channel:
 
 ```
-slack-qurl-bot/
-├── app.py              # 主应用 - Slack Bot 逻辑
-├── config.py           # 配置管理
-├── services/
-│   ├── layerv.py       # LayerV QURL API 客户端
-│   └── url_parser.py   # URL 提取与解析
-├── requirements.txt
-├── .env.example
-└── README.md
+google.com please give me a proxy link
+@qurl-bot-slack https://github.com proxy link 7 days
 ```
 
-## 注意事项
+## Layout (partial)
 
-- 需要有效的 LayerV API 凭证
-- Bot 使用 Socket Mode，无需公网 IP
-- 默认 QURL 有效期为 24 小时，可通过消息指定
+```
+├── app.py                 # entrypoint
+├── config.py              # settings
+├── adapters/slack_app.py  # Bolt AsyncApp, OAuth, Socket Mode
+├── core/bot_core.py      # QURL logic
+├── services/              # LayerV, AI, parsing, i18n
+└── requirements.txt
+```
+
+## Notes
+
+- You need a valid **LayerV API key** path and **Anthropic API key** (see `.env`).
+- For Marketplace listing, disclose LLM usage and data retention per Slack’s checklist.
+- If you change bot scopes or slash command names, update the Slack app and this repo’s docs.

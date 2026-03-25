@@ -1,8 +1,8 @@
 """
-Platform-agnostic bot logic for QURL proxy generation.
+qurl-bot-slack: Slack bot logic for QURL proxy generation.
 
 Handles message analysis, URL extraction, QURL creation.
-Returns message content to be sent - each platform adapter formats & sends.
+Returns message content to be sent by the Slack adapter.
 """
 
 import logging
@@ -13,47 +13,30 @@ from services.layerv import layerv_client, InvalidApiKeyError
 from services.ai_analyzer import ai_analyzer
 from services.url_parser import extract_urls, normalize_url, is_valid_url
 from services.i18n import get_message
-from services.user_store import user_store
 from services.time_utils import format_utc_to_local, format_expires_in_display
+import services.workspace_key_store as workspace_key_store
 
 logger = logging.getLogger(__name__)
 
-PLATFORM_SLACK = "slack"
-PLATFORM_DISCORD = "discord"
+
+def resolve_layerv_api_key(team_id: str | None) -> str | None:
+    """Workspace-specific key in SQLite, else optional env LAYERV_API_KEY fallback."""
+    if team_id:
+        k = workspace_key_store.get_api_key(team_id)
+        if k:
+            return k
+    return settings.layerv_api_key
 
 
-def _key_id(platform: str, raw_id: str) -> str:
-    """Get storage key ID for Discord (per-user)."""
-    return f"{platform}:{raw_id}"
+def has_layerv_api_key(team_id: str | None) -> bool:
+    return bool(resolve_layerv_api_key(team_id))
 
 
-def _get_api_key(platform: str, user_id: str) -> str | None:
-    """Get API key. Slack reads from .env; Discord from per-user store."""
-    if platform == PLATFORM_SLACK:
-        return settings.layerv_api_key
-    return user_store.get_api_key(_key_id(platform, user_id))
-
-
-def _has_api_key(platform: str, user_id: str) -> bool:
-    if platform == PLATFORM_SLACK:
-        return bool(settings.layerv_api_key)
-    return user_store.has_api_key(_key_id(platform, user_id))
-
-
-def preprocess_text(text: str, platform: str) -> str:
-    """
-    Preprocess message text for platform-specific formats.
-
-    - Slack: <http://url|display> or <@USER> mentions
-    - Discord: <@!123> mentions, similar link formats
-    """
-    # Slack link format
+def preprocess_text(text: str) -> str:
+    """Strip Slack link formatting and mentions from message text."""
     text = re.sub(r"<(https?://[^|>]+)\|[^>]+>", r"\1", text)
     text = re.sub(r"<(https?://[^>]+)>", r"\1", text)
-    # Slack mentions: <@U123ABC>
     text = re.sub(r"<@[A-Z0-9]+>", "", text)
-    # Discord mentions: <@!123456> or <@123456>
-    text = re.sub(r"<@!?\d+>", "", text)
     return text.strip()
 
 
@@ -64,6 +47,7 @@ def detect_language(text: str) -> str:
     return "en"
 
 
+# English + Chinese tokens for lightweight dashboard-intent detection (not i18n strings).
 _QURL_DASHBOARD_KEYWORDS = [
     "dashboard", "stats", "stat", "status", "portal", "console",
     "状态", "统计", "面板", "控制台",
@@ -103,9 +87,7 @@ def _is_qurl_dashboard_request(text: str) -> bool:
     return False
 
 
-async def analyze_message(
-    text: str, user_id: str, platform: str
-) -> dict:
+async def analyze_message(text: str, user_id: str, team_id: str | None) -> dict:
     """
     Analyze message: AI analysis + URL extraction + API key validation.
     Call once, then use build_proxy_reply() per recipient.
@@ -124,10 +106,9 @@ async def analyze_message(
         lang = detect_language(text)
         return {"dashboard": True, "lang": lang}
 
-    if not _has_api_key(platform, str(user_id)):
+    if not has_layerv_api_key(team_id):
         lang = detect_language(text)
-        no_key_msg = "no_api_key_env" if platform == PLATFORM_SLACK else "no_api_key"
-        return {"error": get_message(no_key_msg, lang), "lang": lang}
+        return {"error": get_message("no_api_key_workspace", lang), "lang": lang}
 
     try:
         analysis = await ai_analyzer.analyze(text)
@@ -146,10 +127,9 @@ async def analyze_message(
         if not all_urls:
             return {"error": get_message("no_url_detected", lang), "lang": lang}
 
-        api_key = _get_api_key(platform, str(user_id))
+        api_key = resolve_layerv_api_key(team_id)
         if not api_key:
-            no_key_msg = "no_api_key_env" if platform == PLATFORM_SLACK else "no_api_key"
-            return {"error": get_message(no_key_msg, lang), "lang": lang}
+            return {"error": get_message("no_api_key_workspace", lang), "lang": lang}
 
         return {
             "urls": all_urls,
@@ -169,7 +149,6 @@ async def build_proxy_reply(
     expires_in: str,
     reason: str,
     lang: str,
-    platform: str,
     user_id: str,
     user_tz: str | None = None,
 ) -> tuple[str, str]:
@@ -192,8 +171,7 @@ async def build_proxy_reply(
                 api_key=api_key,
                 target_url=url,
                 expires_in=expires_in,
-                description=reason
-                or f"Generated via {platform} bot for user {user_id}",
+                description=reason or f"Generated via qurl-bot-slack for user {user_id}",
             )
             if user_tz:
                 expires_display = format_utc_to_local(qurl_response.expires_at, user_tz=user_tz)
@@ -207,7 +185,7 @@ async def build_proxy_reply(
                 }
             )
         except InvalidApiKeyError:
-            logger.error(f"Invalid API key for {platform}:{user_id}")
+            logger.error(f"Invalid API key for slack user {user_id}")
             return get_message("invalid_api_key", lang), lang
         except Exception as e:
             logger.error(f"Failed to create QURL for {url}: {e}")
@@ -236,18 +214,18 @@ async def build_proxy_reply(
 async def process_message(
     text: str,
     user_id: str,
-    platform: str,
+    team_id: str | None,
     user_tz: str | None = None,
 ) -> tuple[str, str]:
     """Single-user convenience wrapper: analyze once + build proxies."""
-    result = await analyze_message(text, user_id, platform)
+    result = await analyze_message(text, user_id, team_id)
     if "dashboard" in result:
         return _dashboard_reply(result["lang"]), result["lang"]
     if "error" in result:
         return result["error"], result["lang"]
     return await build_proxy_reply(
         result["urls"], result["api_key"], result["expires_in"],
-        result["reason"], result["lang"], platform, user_id, user_tz,
+        result["reason"], result["lang"], user_id, user_tz,
     )
 
 
@@ -258,66 +236,70 @@ def _dashboard_reply(lang: str) -> str:
     return get_message("qurl_dashboard_not_configured", lang)
 
 
-async def handle_setkey(user_id: str, api_key: str, platform: str) -> tuple[str, str]:
-    """Handle /setkey command. Returns (message, lang)."""
-    lang = "en"
-    if platform == PLATFORM_SLACK:
-        return get_message("slack_cmd_disabled", lang), lang
-
-    kid = _key_id(platform, str(user_id))
-    if not api_key:
+async def handle_setkey(
+    api_key: str,
+    team_id: str | None,
+    is_admin: bool,
+    lang: str,
+) -> tuple[str, str]:
+    """Store LayerV key for team_id. DM-only and eligibility are enforced in the Slack adapter."""
+    if not team_id:
+        return get_message("no_team_context", lang), lang
+    if not is_admin:
+        return get_message("key_admin_only", lang), lang
+    key = api_key.strip()
+    if not key:
         return get_message("setkey_usage", lang), lang
-
+    if not await layerv_client.verify_api_key(key):
+        return get_message("setkey_invalid", lang), lang
     try:
-        user_store.set_api_key(kid, api_key)
+        workspace_key_store.set_api_key(team_id, key)
         return get_message("setkey_success", lang), lang
     except Exception as e:
-        logger.error(f"Error setting API key ({kid}): {e}")
+        logger.error(f"setkey store error: {e}")
         return get_message("setkey_error", lang, error=str(e)), lang
 
 
 async def handle_mykey(
-    user_id: str,
-    platform: str,
-    user_tz: str | None = None,
+    team_id: str | None,
+    is_admin: bool,
+    user_tz: str | None,
+    lang: str,
 ) -> tuple[str, str]:
-    """Handle /mykey command. Returns (message, lang)."""
-    lang = "en"
+    """Show stored key prefix for authorized callers (eligibility checked in the adapter)."""
+    if not is_admin:
+        return get_message("key_admin_only", lang), lang
+    if not team_id:
+        return get_message("no_team_context", lang), lang
 
-    if platform == PLATFORM_SLACK:
-        key = settings.layerv_api_key
-        if key:
-            prefix = key[:8] + "..." if len(key) > 8 else key
-            return get_message("slack_mykey_info", lang, prefix=prefix), lang
-        return get_message("no_api_key_env", lang), lang
-
-    kid = _key_id(platform, str(user_id))
-    key_info = user_store.get_key_info(kid)
-    if key_info:
-        created_at = (
-            format_utc_to_local(key_info["created_at"], user_tz=user_tz)
-            if key_info.get("created_at")
-            else key_info.get("created_at", "-")
-        )
+    info = workspace_key_store.get_key_info(team_id)
+    if info:
+        updated = info["updated_at"] or "-"
+        try:
+            updated = format_utc_to_local(updated, user_tz=user_tz) if updated.endswith("Z") or "+" in updated else updated
+        except Exception:
+            pass
         return (
             get_message(
-                "mykey_info",
+                "workspace_mykey_info",
                 lang,
-                prefix=key_info["api_key_prefix"],
-                created_at=created_at,
+                prefix=info["api_key_prefix"],
+                updated_at=updated,
             ),
             lang,
         )
-    return get_message("mykey_none", lang), lang
+    if settings.layerv_api_key:
+        prefix = settings.layerv_api_key[:8] + "..." if len(settings.layerv_api_key) > 8 else settings.layerv_api_key
+        return get_message("mykey_fallback_server_env", lang, prefix=prefix), lang
+    return get_message("mykey_none_workspace", lang), lang
 
 
-async def handle_delkey(user_id: str, platform: str) -> tuple[str, str]:
-    """Handle /delkey command. Returns (message, lang)."""
-    lang = "en"
-    if platform == PLATFORM_SLACK:
-        return get_message("slack_cmd_disabled", lang), lang
-
-    kid = _key_id(platform, str(user_id))
-    if user_store.delete_api_key(kid):
+async def handle_delkey(team_id: str | None, is_admin: bool, lang: str) -> tuple[str, str]:
+    """Remove stored workspace key. Caller must be authorized (adapter checks entitlements)."""
+    if not team_id:
+        return get_message("no_team_context", lang), lang
+    if not is_admin:
+        return get_message("key_admin_only", lang), lang
+    if workspace_key_store.delete_api_key(team_id):
         return get_message("delkey_success", lang), lang
-    return get_message("delkey_none", lang), lang
+    return get_message("delkey_none_workspace", lang), lang

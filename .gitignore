@@ -31,3 +31,6 @@ Thumbs.db
 
 # Local development
 *.local
+
+# SQLite + OAuth state (Slack installations)
+data/

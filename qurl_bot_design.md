@@ -1,8 +1,8 @@
-# Qurl Bot — Design Document
+# qurl-bot-slack — Design Document
 
 ## 1. Overview
 
-Qurl Bot is a multi-platform chatbot (Slack + Discord) that generates secure, time-limited QURL proxy links on demand. When a user mentions `@qurl <url or website name>` in a channel or sends a direct message, the bot uses an LLM (Claude) to interpret the user's intent and extract the target URL, then calls LayerV's QURL API to generate a cryptographic access link. The proxy link is delivered via DM for privacy.
+qurl-bot-slack is a multi-platform chatbot (Slack + Discord) that generates secure, time-limited QURL proxy links on demand. When a user mentions `@qurl <url or website name>` in a channel or sends a direct message, the bot uses an LLM (Claude) to interpret the user's intent and extract the target URL, then calls LayerV's QURL API to generate a cryptographic access link. The proxy link is delivered via DM for privacy.
 
 **Key properties of a QURL:**
 - Identity-verified: only issued to confirmed workspace/server members
@@ -24,7 +24,7 @@ Qurl Bot is a multi-platform chatbot (Slack + Discord) that generates secure, ti
 | Actor | Role |
 |---|---|
 | **User** | Slack workspace member or Discord server member who requests a QURL via @mention or DM, in natural language |
-| **Qurl Bot** | Python application that handles the mention/DM, interprets the URL via LLM, and calls LayerV |
+| **qurl-bot-slack** | Python application that handles the mention/DM, interprets the URL via LLM, and calls LayerV |
 | **LLM (Claude)** | Extracts well-formed URLs from the user's natural language message, detects language and intent |
 | **Slack API** | Used by the bot to receive events (Socket Mode), get user info (timezone, email), and send messages |
 | **Discord API** | Used by the bot to receive events (Gateway), send messages, and register slash commands |
@@ -135,7 +135,7 @@ If either call fails, the QURL is not generated and a 401 is returned to the bot
 
 ## 3. Components
 
-### 3.1 Qurl Bot
+### 3.1 qurl-bot-slack
 
 - **Runtime:** Python 3.12+
 - **Frameworks:**
@@ -149,7 +149,7 @@ If either call fails, the QURL is not generated and a 401 is returned to the bot
 #### Project Structure
 
 ```
-slack-qurl-bot/
+qurl-bot-slack/
 ├── run.py                    # Unified entry point (Slack + Discord)
 ├── app.py                    # Backward-compatible Slack-only entry point
 ├── config.py                 # Configuration management (pydantic-settings)
@@ -289,7 +289,7 @@ Content-Type: application/json
 
 ## 4. Environment Variables
 
-### Qurl Bot
+### qurl-bot-slack
 
 | Variable | Required | Description |
 |---|---|---|
@@ -309,7 +309,7 @@ Content-Type: application/json
 
 | Variable | Description |
 |---|---|
-| `PORT` | HTTP port for the QURL service (default: `3000`) |
+| `PORT` | HTTP port for the QURL service (default: `8080`) |
 
 ---
 
@@ -520,7 +520,7 @@ async function generateQurl(targetUrl, verifiedEmail) {
 }
 
 
-app.listen(3000, () => console.log('LayerV QURL service running on :3000'));
+app.listen(8080, () => console.log('LayerV QURL service running on :8080'));
 ```
 
 ---
@@ -532,7 +532,7 @@ app.listen(3000, () => console.log('LayerV QURL service running on :3000'));
 ```bash
 # Clone the repository
 git clone <repo-url>
-cd slack-qurl-bot
+cd qurl-bot-slack
 
 # Create virtual environment
 python3 -m venv venv
@@ -560,17 +560,17 @@ Use the provided `deploy.sh` script:
 sudo bash deploy.sh
 ```
 
-This creates a systemd service (`slack-qurl-bot.service`) that:
-- Runs `python run.py` as the entry point
+This creates a systemd service (`qurl-bot-slack.service`) that:
+- Runs `python app.py` as the entry point
 - Automatically restarts on failure (10s delay)
 - Logs to systemd journal
 
 Common commands:
 ```bash
-systemctl status slack-qurl-bot     # Check status
-journalctl -u slack-qurl-bot -f     # View logs
-systemctl restart slack-qurl-bot    # Restart
-systemctl stop slack-qurl-bot       # Stop
+systemctl status qurl-bot-slack     # Check status
+journalctl -u qurl-bot-slack -f     # View logs
+systemctl restart qurl-bot-slack    # Restart
+systemctl stop qurl-bot-slack       # Stop
 ```
 
 ### 8.3 Error Isolation
@@ -581,7 +581,7 @@ systemctl stop slack-qurl-bot       # Stop
 
 ## 9. Security Notes
 
-- **Bot token is never exposed to the user.** It travels server-to-server (Qurl Bot → LayerV backend) only.
+- **Bot token is never exposed to the user.** It travels server-to-server (qurl-bot-slack → LayerV backend) only.
 - **Email spoofing is prevented.** LayerV independently verifies the email via `users.lookupByEmail` rather than trusting the bot's claim alone.
 - **QURL links are ephemeral.** They expire automatically and cannot be replayed after the session ends.
 - **Proxy links are sent via DM.** When a user requests a proxy in a channel, the actual link is delivered privately via DM, reducing exposure to other channel members.

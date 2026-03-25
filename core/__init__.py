@@ -1,4 +1,4 @@
-"""Platform-agnostic bot core logic."""
+"""Slack bot core (QURL generation logic)."""
 
 from core.bot_core import process_message
 
