@@ -21,6 +21,7 @@ from typing import Literal
 from slack_sdk.web.async_client import AsyncWebClient
 
 from config import settings
+from services.slack_ssl import aiohttp_ssl_context
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,11 @@ async def _admin_roles_confirms_org_admin(user_id: str, enterprise_id: str) -> b
     if not role_ids:
         logger.debug("Admin roles API fallback enabled but SLACK_ORG_ADMIN_ROLE_IDS is empty")
         return False
-    admin_client = AsyncWebClient(token=settings.slack_admin_user_token)
+    ssl_ctx = aiohttp_ssl_context()
+    admin_client = AsyncWebClient(
+        token=settings.slack_admin_user_token,
+        ssl=ssl_ctx,
+    )
     cursor: str | None = None
     try:
         while True:

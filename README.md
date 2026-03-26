@@ -1,6 +1,6 @@
 # qurl-bot-slack
 
-Generates secure proxy links via the LayerV QURL API in Slack. Supports **OAuth multi-workspace install** (for [Slack Marketplace](https://api.slack.com/docs/slack-apps-checklist) style distribution), **SQLite** for installation data, and **Socket Mode** for events.
+Generates secure proxy links via the LayerV QURL API in Slack. Supports **OAuth multi-workspace install** (for [Slack Marketplace](https://api.slack.com/docs/slack-apps-checklist) style distribution), **on-disk file storage** for OAuth installs and per-workspace LayerV keys (no SQLite), and **Socket Mode** for events.
 
 ## Features
 
@@ -17,7 +17,7 @@ Generates secure proxy links via the LayerV QURL API in Slack. Supports **OAuth 
 
 - Python 3.10+
 - Slack app with **Socket Mode** and **OAuth** (distribution / App Directory)
-- Public **HTTPS** reverse proxy to this process’s HTTP port (OAuth install/callback only — **not** Events HTTP)
+- For OAuth install/callback only (**not** Events HTTP): **testing** may use **`http://`** (e.g. localhost or IP) where Slack allows it; **production / App Directory** should use a public **HTTPS** reverse proxy to this process’s `HTTP_HOST`/`HTTP_PORT`.
 
 ## Quick start
 
@@ -45,7 +45,7 @@ Generates secure proxy links via the LayerV QURL API in Slack. Supports **OAuth 
 cp .env.example .env
 ```
 
-Required variables are documented in `.env.example`. In production use **HTTPS** for `SLACK_REDIRECT_URI` and proxy `https://your.domain` to this service’s `HTTP_HOST`/`HTTP_PORT`.
+Required variables are documented in `.env.example`. **`SLACK_REDIRECT_URI` must match Slack’s Redirect URLs exactly** (including `http` vs `https`). Use **`http://`** for local/dev testing if Slack accepts it; use **`https://your.domain`** in production and terminate TLS at your reverse proxy.
 
 ### 3. Install and run
 
@@ -61,12 +61,19 @@ The process:
 - Serves **`/slack/install`** and **`/slack/oauth_redirect`** on `HTTP_HOST`/`HTTP_PORT` (OAuth)
 - Connects to Slack via Socket Mode for events
 
-Install URL (browser): `https://your.domain/slack/install` (same host as Redirect URL; HTTPS in production).
+Install URL (browser): `https://your.domain/slack/install` in production; during testing you may use `http://127.0.0.1:8080/slack/install` or `http://IP:PORT/slack/install` if it matches `SLACK_REDIRECT_URI` (same scheme/host/port as configured in Slack).
 
 ### 4. Data
 
-- **`SQLITE_DATABASE_PATH`** (default `data/slack_app.db`): OAuth installs (incl. bot tokens), via `slack_sdk` `SQLite3InstallationStore`.
+- **`SLACK_INSTALLATION_BASE_DIR`** (default `data/slack_installations`): OAuth installs (bot tokens), via `slack_sdk` `FileInstallationStore`.
+- **`WORKSPACE_LAYERV_KEYS_PATH`** (default `data/workspace_layerv_keys.json`): encrypted LayerV API keys per Slack workspace (`/setkey`).
 - **`OAUTH_STATE_DIR`**: short-lived OAuth `state` files (CSRF).
+
+**Migrating from SQLite builds:** older deployments stored OAuth + LayerV keys in `data/slack_app.db`. Current code does not read that file. After upgrade, **reinstall the app** to each workspace (OAuth) and run **`/setkey`** again in DM to restore LayerV keys.
+
+**Why `pysqlite3-binary`:** `slack-bolt` imports OAuth code that loads the stdlib `sqlite3` module at startup, even when using file-based installation stores. If your Python was built without `_sqlite3` (e.g. `/usr/local` without `sqlite-devel`), `app.py` registers `pysqlite3` as `sqlite3` before any Bolt import. Normal Python builds ignore this package.
+
+**Slack TLS / `SSLCertVerificationError`:** Slack clients use **aiohttp**, which does not automatically use **certifi**. The app sets `AsyncWebClient(ssl=ssl.create_default_context(cafile=certifi.where()))` by default so certificate verification works on hosts with weak system CA stores. Use **`SLACK_INSECURE_SSL=true`** only as a last resort for temporary testing.
 
 ## Example usage
 

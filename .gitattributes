@@ -1,0 +1,2 @@
+# Shell scripts must use LF so Linux shebang works (avoid /bin/bash^M)
+*.sh text eol=lf

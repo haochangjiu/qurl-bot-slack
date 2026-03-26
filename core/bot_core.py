@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def resolve_layerv_api_key(team_id: str | None) -> str | None:
-    """Workspace-specific key in SQLite, else optional env LAYERV_API_KEY fallback."""
+    """Workspace-specific key in file store, else optional env LAYERV_API_KEY fallback."""
     if team_id:
         k = workspace_key_store.get_api_key(team_id)
         if k:

@@ -1,6 +1,8 @@
 """
 User-facing Slack messages. The ``zh`` entry holds Chinese copy; ``en`` holds English.
 Other modules should not embed Chinese UI strings—use ``get_message`` here.
+
+Slack uses *mrkdwn*: bold is *single asterisks*, not **Markdown double asterisks**.
 """
 
 MESSAGES = {
@@ -38,21 +40,24 @@ MESSAGES = {
         "no_api_key_env": "⚠️ API Key 未配置，请联系管理员在服务端 .env 文件中设置 LAYERV_API_KEY。",
         "no_api_key_workspace": (
             "⚠️ 本工作区尚未配置 LayerV API Key。\n"
-            "请联系**工作区管理员**在**私信**中使用 `/setkey <your_api_key>` 完成配置。\n\n"
+            "请联系*工作区管理员*在*私信*中使用 `/setkey <your_api_key>` 完成配置。\n\n"
             "获取 Key: https://layerv.ai/qurl/dashboard/keys"
         ),
         "key_ops_dm_only": (
-            "🔒 为保护 API Key，LayerV Key 相关操作仅可在**与机器人的私信**中进行。\n"
+            "🔒 为保护 API Key，LayerV Key 相关操作仅可在*与机器人的私信*中进行。\n"
             "请打开与机器人的私信窗口，再使用 `/setkey`、`/mykey` 或 `/delkey`（仅工作区管理员）。"
         ),
         "key_admin_only": (
-            "⛔ 无权操作 LayerV Key。\n"
-            "• **Enterprise Grid**：需为 **Enterprise 组织** Primary Owner / Owner / Admin（非仅工作区管理员）。\n"
-            "• **非 Enterprise 工作区**：需为工作区 Primary Owner / Owner / Admin（若管理员关闭了此兜底，则仅能通过服务端环境变量配置）。"
+            "⛔ 您当前账号*无权*使用 `/setkey`。\n\n"
+            "本工作区*没有*面向普通成员的默认 LayerV API Key；必须由*具备权限的管理员*在*与机器人的私信*中执行 `/setkey` 后，本工作区才能调用 QURL。\n\n"
+            "*谁可以配置：*\n"
+            "• *Enterprise Grid（企业网格）*：须为 *Enterprise 组织级* Primary Owner / Owner / Admin（仅「工作区管理员」不够）。\n"
+            "• *普通工作区*：须为工作区的 Primary Owner / Owner / Admin。\n\n"
+            "若您需要 Key，请联系上述管理员；从 LayerV 获取 Key：https://layerv.ai/qurl/dashboard/keys"
         ),
         "key_enterprise_org_admin_only": (
-            "⛔ 在 **Enterprise Grid** 下，仅 **Enterprise 组织管理员/所有者**（`enterprise_user` 组织级角色）可在私信中配置 LayerV Key；"
-            "仅担任**工作区**管理员是不够的。请联系组织 Primary Owner 或拥有 Organization Admin 角色的成员。"
+            "⛔ 在 *Enterprise Grid* 下，仅 *Enterprise 组织管理员/所有者*（`enterprise_user` 组织级角色）可在私信中配置 LayerV Key；"
+            "仅担任*工作区*管理员是不够的。请联系组织 Primary Owner 或拥有 Organization Admin 角色的成员。"
         ),
         "no_team_context": "⚠️ 无法识别工作区上下文，请稍后重试或重新安装应用。",
         "workspace_mykey_info": "🔑 本工作区 LayerV Key: `{prefix}`\n更新时间: {updated_at}",
@@ -122,21 +127,24 @@ MESSAGES = {
         "no_api_key_env": "⚠️ API Key not configured. Please ask the admin to set LAYERV_API_KEY in the server .env file.",
         "no_api_key_workspace": (
             "⚠️ This workspace has no LayerV API Key configured yet.\n"
-            "Ask a **workspace admin** to open a **DM with this bot** and run `/setkey <your_api_key>`.\n\n"
+            "Ask a *workspace admin* to open a *DM with this bot* and run `/setkey <your_api_key>`.\n\n"
             "Get a key: https://layerv.ai/qurl/dashboard/keys"
         ),
         "key_ops_dm_only": (
-            "🔒 To protect your API key, LayerV key commands work only in a **direct message** with this bot.\n"
+            "🔒 To protect your API key, LayerV key commands work only in a *direct message* with this bot.\n"
             "Open a DM with the bot, then use `/setkey`, `/mykey`, or `/delkey` (workspace admins only)."
         ),
         "key_admin_only": (
-            "⛔ You are not allowed to manage the LayerV API Key.\n"
-            "• **Enterprise Grid**: you must be an **Enterprise organization** Primary Owner, Owner, or Admin (not merely a workspace admin).\n"
-            "• **Non-Enterprise workspaces**: workspace Primary Owner / Owner / Admin may be allowed (unless this fallback is disabled server-side; otherwise use env `LAYERV_API_KEY`)."
+            "⛔ Your account *cannot* use `/setkey`.\n\n"
+            "This workspace has *no* default LayerV API Key for regular members. Someone with the *required admin role* must run `/setkey` in a *DM with this bot* before the workspace can use QURL.\n\n"
+            "*Who may configure the key:*\n"
+            "• *Enterprise Grid*: you must be an *Enterprise organization* Primary Owner, Owner, or Admin (workspace-only admin is *not* enough).\n"
+            "• *Standard workspace*: you must be the workspace Primary Owner, Owner, or Admin.\n\n"
+            "Ask one of the above admins if you need a key. Get a key from LayerV: https://layerv.ai/qurl/dashboard/keys"
         ),
         "key_enterprise_org_admin_only": (
-            "⛔ On **Enterprise Grid**, only **Enterprise organization** owners/admins (org-level `enterprise_user` roles) may configure the LayerV key in DM; "
-            "being a **workspace** admin alone is not sufficient. Ask your org Primary Owner or a member with the Organization Admin role."
+            "⛔ On *Enterprise Grid*, only *Enterprise organization* owners/admins (org-level `enterprise_user` roles) may configure the LayerV key in DM; "
+            "being a *workspace* admin alone is not sufficient. Ask your org Primary Owner or a member with the Organization Admin role."
         ),
         "no_team_context": "⚠️ Could not determine workspace context. Please try again or reinstall the app.",
         "workspace_mykey_info": "🔑 Workspace LayerV Key: `{prefix}`\nLast updated: {updated_at}",

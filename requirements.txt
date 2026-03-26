@@ -1,3 +1,4 @@
+# Python 3.10+ required (README). CentOS 7 yum's python3 is 3.6 — use 3.10+ (SCL / IUS / source).
 slack-bolt>=1.18.0
 slack-sdk>=3.27.0
 httpx>=0.25.0
@@ -6,5 +7,8 @@ pydantic>=2.0.0
 pydantic-settings>=2.0.0
 anthropic>=0.40.0
 aiohttp>=3.9.0
+certifi
 cryptography>=41.0.0
 tzdata>=2024.1
+# When CPython has no _sqlite3, slack-bolt still imports sqlite3 at load time; this provides it.
+pysqlite3-binary

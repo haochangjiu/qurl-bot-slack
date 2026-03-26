@@ -25,8 +25,11 @@ class Settings(BaseSettings):
     slack_bot_scopes: str = DEFAULT_SLACK_BOT_SCOPES
     """Comma-separated bot token scopes."""
 
-    # SQLite installation store (slack_sdk.oauth.installation_store.sqlite3.SQLite3InstallationStore)
-    sqlite_database_path: Path = Path("data/slack_app.db")
+    # Slack OAuth: FileInstallationStore (per-workspace bot tokens under this directory)
+    slack_installation_base_dir: Path = Path("data/slack_installations")
+
+    # Per-workspace LayerV API keys (encrypted JSON file; no SQLite)
+    workspace_layerv_keys_path: Path = Path("data/workspace_layerv_keys.json")
 
     # OAuth state (CSRF) — short-lived; file-based under this directory
     oauth_state_dir: Path = Path("data/oauth_state")
@@ -41,6 +44,9 @@ class Settings(BaseSettings):
     # Optional: redirect browser after successful/failed install (landing page)
     oauth_success_url: str | None = None
     oauth_failure_url: str | None = None
+
+    # Temporary testing only: disable TLS verification for Slack API / Socket Mode (see services/slack_ssl.py).
+    slack_insecure_ssl: bool = False
 
     # Claude API
     anthropic_api_key: str

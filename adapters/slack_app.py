@@ -1,7 +1,7 @@
 """
 Slack adapter for qurl-bot-slack.
 
-OAuth (multi-workspace) + SQLite installation store + Socket Mode for events.
+OAuth (multi-workspace) + file installation store + Socket Mode for events.
 """
 
 import asyncio
@@ -12,10 +12,12 @@ from aiohttp import web
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.oauth.async_oauth_settings import AsyncOAuthSettings
-from slack_sdk.oauth.installation_store.sqlite3 import SQLite3InstallationStore
+from slack_sdk.oauth.installation_store.file import FileInstallationStore
 from slack_sdk.oauth.state_store.file import FileOAuthStateStore
+from slack_sdk.web.async_client import AsyncWebClient
 
 from config import settings
+from services.slack_ssl import aiohttp_ssl_context
 from core.bot_core import (
     process_message,
     analyze_message,
@@ -27,7 +29,7 @@ from core.bot_core import (
     preprocess_text,
     detect_language,
 )
-from services.workspace_key_store import init_workspace_key_table
+from services.workspace_key_store import init_workspace_key_store
 from services.slack_entitlements import classify_layerv_key_eligibility
 from services.i18n import get_message
 
@@ -40,12 +42,12 @@ def _scope_list() -> list[str]:
 
 
 def build_slack_app() -> AsyncApp:
-    settings.sqlite_database_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.slack_installation_base_dir.mkdir(parents=True, exist_ok=True)
     settings.oauth_state_dir.mkdir(parents=True, exist_ok=True)
-    init_workspace_key_table()
+    init_workspace_key_store()
 
-    installation_store = SQLite3InstallationStore(
-        database=str(settings.sqlite_database_path),
+    installation_store = FileInstallationStore(
+        base_dir=str(settings.slack_installation_base_dir),
         client_id=settings.slack_client_id,
         logger=logger,
     )
@@ -70,9 +72,14 @@ def build_slack_app() -> AsyncApp:
         failure_url=settings.oauth_failure_url,
     )
 
+    ssl_ctx = aiohttp_ssl_context()
+    # Always pass explicit ssl when we have a context (certifi or insecure); avoids broken system CA on some hosts.
+    bolt_client = AsyncWebClient(ssl=ssl_ctx) if ssl_ctx is not None else None
+
     app = AsyncApp(
         signing_secret=settings.slack_signing_secret,
         oauth_settings=oauth_settings,
+        client=bolt_client,
     )
     register_slack_handlers(app)
     return app
@@ -138,6 +145,11 @@ def _layerv_key_denial_message(kind: str, lang: str) -> str:
     return get_message("key_admin_only", lang)
 
 
+def _slash_response_mrkdwn_blocks(text: str) -> list[dict]:
+    """Slack slash-command ``text=`` is often plain; use blocks + mrkdwn for *bold* etc."""
+    return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
+
+
 def _team_id(event_or_cmd: dict, context_team_id: str | None = None) -> str | None:
     if context_team_id:
         return context_team_id
@@ -167,22 +179,29 @@ def register_slack_handlers(app: AsyncApp) -> None:
         channel_id = command["channel_id"]
         lang = detect_language(command.get("text") or "")
         if not await _is_im_channel(client, channel_id):
+            _dm_only = get_message("key_ops_dm_only", lang)
             await respond(
-                text=get_message("key_ops_dm_only", lang),
                 response_type="ephemeral",
+                blocks=_slash_response_mrkdwn_blocks(_dm_only),
+                text=_dm_only,
             )
             return
         lvl = await classify_layerv_key_eligibility(client, user_id)
         if lvl != "ok":
+            _deny = _layerv_key_denial_message(lvl, lang)
             await respond(
-                text=_layerv_key_denial_message(lvl, lang),
                 response_type="ephemeral",
+                blocks=_slash_response_mrkdwn_blocks(_deny),
+                text=_deny,
             )
             return
         api_key = (command.get("text") or "").strip()
         logger.info(f"Slack setkey from admin {user_id}, key_len={len(api_key)}")
         msg, out_lang = await handle_setkey(api_key, team_id, True, lang)
-        await respond(text=msg)
+        await respond(
+            blocks=_slash_response_mrkdwn_blocks(msg),
+            text=msg,
+        )
 
     @app.command("/mykey")
     async def handle_mykey_slack(ack, command, client, respond):
@@ -192,21 +211,25 @@ def register_slack_handlers(app: AsyncApp) -> None:
         channel_id = command["channel_id"]
         lang = detect_language(command.get("text") or "")
         if not await _is_im_channel(client, channel_id):
+            _dm_only = get_message("key_ops_dm_only", lang)
             await respond(
-                text=get_message("key_ops_dm_only", lang),
                 response_type="ephemeral",
+                blocks=_slash_response_mrkdwn_blocks(_dm_only),
+                text=_dm_only,
             )
             return
         lvl = await classify_layerv_key_eligibility(client, user_id)
         if lvl != "ok":
+            _deny = _layerv_key_denial_message(lvl, lang)
             await respond(
-                text=_layerv_key_denial_message(lvl, lang),
                 response_type="ephemeral",
+                blocks=_slash_response_mrkdwn_blocks(_deny),
+                text=_deny,
             )
             return
         user_info = await _get_slack_user_info(client, user_id)
         msg, _ = await handle_mykey(team_id, True, user_info["tz"], lang)
-        await respond(text=msg)
+        await respond(blocks=_slash_response_mrkdwn_blocks(msg), text=msg)
 
     @app.command("/delkey")
     async def handle_delkey_slack(ack, command, client, respond):
@@ -216,20 +239,24 @@ def register_slack_handlers(app: AsyncApp) -> None:
         channel_id = command["channel_id"]
         lang = detect_language(command.get("text") or "")
         if not await _is_im_channel(client, channel_id):
+            _dm_only = get_message("key_ops_dm_only", lang)
             await respond(
-                text=get_message("key_ops_dm_only", lang),
                 response_type="ephemeral",
+                blocks=_slash_response_mrkdwn_blocks(_dm_only),
+                text=_dm_only,
             )
             return
         lvl = await classify_layerv_key_eligibility(client, user_id)
         if lvl != "ok":
+            _deny = _layerv_key_denial_message(lvl, lang)
             await respond(
-                text=_layerv_key_denial_message(lvl, lang),
                 response_type="ephemeral",
+                blocks=_slash_response_mrkdwn_blocks(_deny),
+                text=_deny,
             )
             return
         msg, _ = await handle_delkey(team_id, True, lang)
-        await respond(text=msg)
+        await respond(blocks=_slash_response_mrkdwn_blocks(msg), text=msg)
 
     @app.event("app_mention")
     async def handle_app_mention(event, say, client, context=None):
@@ -412,7 +439,12 @@ async def run_slack() -> None:
     bolt_app = build_slack_app()
     runner = await run_slack_oauth_server(bolt_app)
     try:
-        handler = AsyncSocketModeHandler(bolt_app, settings.slack_app_token)
+        # Socket Mode must use the same AsyncWebClient (and ssl=) as Bolt — see slack_sdk SocketModeClient.ws_connect
+        handler = AsyncSocketModeHandler(
+            bolt_app,
+            settings.slack_app_token,
+            web_client=bolt_app.client,
+        )
         logger.info("Starting qurl-bot-slack (Socket Mode + OAuth)...")
         await handler.start_async()
     finally:
